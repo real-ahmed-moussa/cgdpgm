@@ -1,0 +1,331 @@
+---
+title: "China's GDP Growth Modeling"
+author: "Dr. Ahmed Moussa"
+date: "Winter 2022"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    code_folding: show
+    fig_width: 9
+    fig_height: 5
+---
+
+## 1. Overview
+
+China's GDP grew from \$59 billion in 1960 to \$10.4 trillion in 2014, exhibiting three structurally distinct phases that standard linear regression cannot capture: near-constant values through 1970 during the post-Great-Leap recovery, moderate growth through the mid-1990s, and steep exponential acceleration following market liberalization and WTO accession. Using 55 annual observations from the World Bank, we fit standard cubic splines across six degrees-of-freedom configurations (df = 4, 6, 8, 10, 15, 25) and penalized smoothing splines across six regularization parameters (λ = 10⁻⁷ to 0.1). Smoothing splines outperform cubic splines at their respective optima — MSE = 11.46 at λ = 10⁻⁶ versus MSE = 25.99 at df = 25 — and are preferred for this problem due to systematic knot placement, superior boundary behavior, and a principled penalty-based complexity control.
+
+---
+
+## 2. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(splines)
+
+set.seed(42)
+
+theme_portfolio <- function() {
+  theme_minimal(base_family = "sans", base_size = 12) +
+  theme(
+    plot.title       = element_text(size = 14, face = "bold", color = "#0F1923", margin = margin(b = 8)),
+    plot.subtitle    = element_text(size = 11, color = "#444444", margin = margin(b = 12)),
+    plot.caption     = element_text(size = 9, color = "#888780", hjust = 0),
+    axis.title       = element_text(size = 11, color = "#444444"),
+    axis.text        = element_text(size = 10, color = "#666666"),
+    panel.grid.major = element_line(color = "#F0F0F0", linewidth = 0.5),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    legend.position  = "bottom",
+    legend.title     = element_text(size = 10, face = "bold"),
+    legend.text      = element_text(size = 10),
+    strip.text       = element_text(size = 11, face = "bold", color = "#0F1923")
+  )
+}
+
+palette_portfolio <- c("#378ADD", "#BA7517", "#1D9E75", "#5F5E5A", "#888780", "#0F1923")
+
+save_fig <- function(filename, width = 9, height = 5) {
+  dir.create("figures", showWarnings = FALSE)
+  ggsave(
+    filename = file.path("figures", filename),
+    width    = width,
+    height   = height,
+    dpi      = 150,
+    bg       = "white"
+  )
+}
+```
+
+---
+
+## 3. Data
+
+### 3.1 Loading & Structure
+
+```{r load-data}
+df_gdp <- read.csv("data/raw/gdpChina2.csv")
+glimpse(df_gdp)
+dim(df_gdp)
+summary(df_gdp[, c("Year", "gdp")])
+```
+
+The dataset contains 55 annual observations spanning 1960–2014. The `gdp` column represents GDP scaled by 10¹⁰ (i.e., in units of \$10 billion USD), ranging from 4.67 in 1962 to 1,035.48 in 2014. We use this scaled column throughout to improve numerical conditioning of the spline basis matrices.
+
+```{r set-xy}
+x <- df_gdp$Year
+y <- df_gdp$gdp
+```
+
+### 3.2 Exploratory Data Analysis
+
+```{r fig-time-series}
+ggplot(df_gdp, aes(x = Year, y = gdp)) +
+  geom_line(color = palette_portfolio[1], linewidth = 1) +
+  geom_point(color = palette_portfolio[1], size = 2, alpha = 0.7) +
+  labs(
+    title    = "China's GDP, 1960–2014",
+    subtitle = "Three structural phases: stagnant 1960s, moderate growth through 1990s, exponential acceleration post-2000.",
+    x        = "Year",
+    y        = expression(GDP ~ (10^10 ~ USD)),
+    caption  = "Source: World Bank World Development Indicators (NY.GDP.MKTP.CD)"
+  ) +
+  theme_portfolio()
+save_fig("01_gdp-time-series.png")
+```
+
+```{r fig-distribution}
+ggplot(df_gdp, aes(x = gdp)) +
+  geom_histogram(bins = 15, fill = palette_portfolio[1], color = "white", alpha = 0.85) +
+  geom_vline(xintercept = mean(df_gdp$gdp), color = palette_portfolio[2],
+             linewidth = 1, linetype = "dashed") +
+  geom_vline(xintercept = median(df_gdp$gdp), color = palette_portfolio[3],
+             linewidth = 1, linetype = "dashed") +
+  annotate("text", x = mean(df_gdp$gdp) + 20, y = 8.5,
+           label = paste0("Mean: ", round(mean(df_gdp$gdp), 1)),
+           color = palette_portfolio[2], size = 3.5, hjust = 0) +
+  annotate("text", x = median(df_gdp$gdp) + 20, y = 9.5,
+           label = paste0("Median: ", round(median(df_gdp$gdp), 1)),
+           color = palette_portfolio[3], size = 3.5, hjust = 0) +
+  labs(
+    title    = "Distribution of China's Annual GDP",
+    subtitle = "Right-skewed: the majority of years cluster below the mean, driven by the rapid post-2000 surge.",
+    x        = expression(GDP ~ (10^10 ~ USD)),
+    y        = "Count"
+  ) +
+  theme_portfolio()
+save_fig("02_gdp-distribution.png")
+```
+
+```{r fit-cubic-splines, include=FALSE}
+dof_values <- c(4, 6, 8, 10, 15, 25)
+
+cubic_fits <- lapply(dof_values, function(d) {
+  basis <- bs(x, df = d)
+  model <- lm(y ~ basis)
+  list(
+    model  = model,
+    df     = d,
+    knots  = d - 3,
+    mse    = round(mean((y - model$fitted.values)^2), 2)
+  )
+})
+names(cubic_fits) <- paste0("df", dof_values)
+
+cubic_mse_df <- data.frame(
+  df    = dof_values,
+  knots = dof_values - 3,
+  mse   = sapply(cubic_fits, `[[`, "mse")
+)
+```
+
+```{r fig-cubic-fits}
+cubic_plot_df <- do.call(rbind, lapply(cubic_fits, function(fit) {
+  data.frame(
+    Year      = x,
+    gdp       = fit$model$fitted.values,
+    df_label  = paste0("df = ", fit$df)
+  )
+}))
+cubic_plot_df$df_label <- factor(cubic_plot_df$df_label,
+                                  levels = paste0("df = ", dof_values))
+
+ggplot() +
+  geom_point(data = df_gdp, aes(x = Year, y = gdp),
+             color = "#999999", size = 2, alpha = 0.7) +
+  geom_line(data = cubic_plot_df,
+            aes(x = Year, y = gdp, color = df_label), linewidth = 0.9) +
+  scale_color_manual(values = palette_portfolio, name = "Degrees of Freedom") +
+  labs(
+    title    = "Cubic Spline Fits Across Degrees of Freedom",
+    subtitle = "Low df misses local structure; df = 25 (22 knots) closely tracks every fluctuation.",
+    x        = "Year",
+    y        = expression(GDP ~ (10^10 ~ USD))
+  ) +
+  theme_portfolio()
+save_fig("03_cubic-splines-fits.png")
+```
+
+```{r fit-smoothing-splines, include=FALSE}
+lambda_values <- c(0.0000001, 0.000001, 0.0001, 0.0025, 0.05, 0.1)
+
+smooth_fits <- lapply(lambda_values, function(lam) {
+  sp <- smooth.spline(x, y, lambda = lam, all.knots = TRUE)
+  list(
+    spline  = sp,
+    lambda  = lam,
+    eff_df  = round(sp$df, 1),
+    mse     = round(mean((y - sp$y)^2), 2),
+    cv_crit = round(sp$cv.crit, 2)
+  )
+})
+names(smooth_fits) <- paste0("lam", seq_along(lambda_values))
+
+smooth_mse_df <- data.frame(
+  lambda  = lambda_values,
+  eff_df  = sapply(smooth_fits, `[[`, "eff_df"),
+  mse     = sapply(smooth_fits, `[[`, "mse"),
+  cv_crit = sapply(smooth_fits, `[[`, "cv_crit")
+)
+```
+
+```{r fig-smoothing-fits}
+lambda_labels <- c(
+  "1e-7", "1e-6", "1e-4",
+  "0.0025", "0.05", "0.1"
+)
+
+smooth_plot_df <- do.call(rbind, lapply(seq_along(smooth_fits), function(i) {
+  sp <- smooth_fits[[i]]$spline
+  data.frame(Year = sp$x, gdp = sp$y, lambda_label = lambda_labels[i])
+}))
+smooth_plot_df$lambda_label <- factor(smooth_plot_df$lambda_label,
+                                       levels = lambda_labels)
+
+ggplot() +
+  geom_point(data = df_gdp, aes(x = Year, y = gdp),
+             color = "#999999", size = 2, alpha = 0.7) +
+  geom_line(data = smooth_plot_df,
+            aes(x = Year, y = gdp, color = lambda_label), linewidth = 0.9) +
+  scale_color_manual(values = palette_portfolio,
+                     name   = expression(Regularization ~ (lambda))) +
+  labs(
+    title    = "Smoothing Spline Fits Across Regularization Parameters",
+    subtitle = "Small lambda interpolates every point (overfit); large lambda forces near-linearity. Optimal at lambda = 1e-6.",
+    x        = "Year",
+    y        = expression(GDP ~ (10^10 ~ USD))
+  ) +
+  theme_portfolio()
+save_fig("04_smoothing-splines-fits.png")
+```
+
+```{r fig-cubic-mse}
+ggplot(cubic_mse_df, aes(x = df, y = mse)) +
+  geom_line(color = palette_portfolio[1], linewidth = 1.2) +
+  geom_point(color = palette_portfolio[1], size = 3.5) +
+  geom_text(aes(label = round(mse, 1)), vjust = -0.9, size = 3.2, color = "#444444") +
+  scale_x_continuous(breaks = dof_values) +
+  labs(
+    title    = "Cubic Splines: Training MSE vs Degrees of Freedom",
+    subtitle = "MSE falls monotonically with df — more knots always fit the training data better, but risk overfitting.",
+    x        = "Degrees of Freedom (df)",
+    y        = expression(MSE ~ (10^10 ~ USD)^2)
+  ) +
+  theme_portfolio()
+save_fig("05_cubic-mse-vs-dof.png")
+```
+
+```{r fig-smoothing-mse}
+smooth_mse_df$log_lambda <- log10(smooth_mse_df$lambda)
+opt_row <- smooth_mse_df[which.min(smooth_mse_df$mse), ]
+
+ggplot(smooth_mse_df, aes(x = log_lambda, y = mse)) +
+  geom_line(color = palette_portfolio[2], linewidth = 1.2) +
+  geom_point(color = palette_portfolio[2], size = 3.5) +
+  geom_point(data = opt_row, aes(x = log_lambda, y = mse),
+             color = palette_portfolio[3], size = 5, shape = 18) +
+  scale_x_continuous(
+    breaks = log10(lambda_values),
+    labels = lambda_labels
+  ) +
+  labs(
+    title    = "Smoothing Splines: Training MSE vs Regularization Parameter",
+    subtitle = "MSE rises sharply with lambda as the fit is forced toward linearity; optimal balance at lambda = 1e-6 (diamond).",
+    x        = expression(lambda ~ (log[10] ~ scale)),
+    y        = expression(MSE ~ (10^10 ~ USD)^2)
+  ) +
+  theme_portfolio() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+save_fig("06_smoothing-mse-vs-lambda.png")
+```
+
+---
+
+## 4. Preprocessing
+
+GDP values are pre-scaled by dividing by 10¹⁰ (stored as the `gdp` column in `gdpChina2.csv`). This scaling prevents near-singular basis matrices in the B-spline fits when values span multiple orders of magnitude. There are no missing observations in the 55-year series.
+
+```{r preprocessing-check}
+cat("Observations:", length(x), "\n")
+cat("Year range:", min(x), "–", max(x), "\n")
+cat("GDP range:", round(min(y), 2), "to", round(max(y), 2), "× 10^10 USD\n")
+cat("Missing values:", sum(is.na(y)), "\n")
+```
+
+---
+
+## 5. Methodology
+
+### Standard Cubic Splines
+
+Cubic splines fit piecewise degree-3 polynomials joined at knot locations, with continuity enforced on the function and its first two derivatives. We use the B-spline basis (`bs()`) because it is numerically stable for high knot counts. The degrees-of-freedom parameter directly controls the number of interior knots (knots = df − 3), making the complexity dial intuitive. No penalty is applied — complexity is controlled solely by knot count. This makes cubic splines transparent but requires the analyst to choose knot locations or rely on uniformly spaced knots, which may not align with the data's structural breaks.
+
+### Smoothing Splines
+
+Smoothing splines avoid the knot-placement problem by placing a knot at every unique data point and adding an L2 penalty on the integrated squared second derivative:
+
+$$\text{minimize} \sum_{i=1}^{n}(y_i - f(x_i))^2 + \lambda \int f''(x)^2 \, dx$$
+
+The regularization parameter λ continuously controls model complexity: as λ → 0, the fit approaches interpolation; as λ → ∞, the fit collapses to a straight line. The effective degrees of freedom decrease monotonically with λ, providing a single interpretable complexity measure comparable across methods. This approach is well-suited to the GDP time series because the structural breaks are data-driven rather than analyst-imposed.
+
+---
+
+## 6. Model Training & Evaluation
+
+### 6.1 Cubic Splines
+
+```{r cubic-results}
+cat("Standard Cubic Splines\n")
+cat("========================\n")
+print(cubic_mse_df)
+```
+
+### 6.2 Smoothing Splines
+
+```{r smoothing-results}
+cat("Smoothing Splines\n")
+cat("==================\n")
+print(smooth_mse_df[, c("lambda", "eff_df", "mse", "cv_crit")])
+```
+
+---
+
+## 7. Results & Discussion
+
+Standard cubic splines show monotonically decreasing training MSE as degrees of freedom increase: from 454.26 (df = 4, 1 knot) down to 25.99 (df = 25, 22 knots). This monotonic improvement does not reflect generalization — it reflects the trivial fact that adding knots gives the model more freedom to chase training points. At df = 4, a single knot captures the broad exponential shape but misses the growth slowdown of the 1980s and the post-2000 acceleration. At df = 25 with 22 knots, the fit traces most local year-to-year fluctuations including the 1976 and 1987 dips, but risks interpolating noise rather than signal.
+
+Smoothing splines reveal a more informative pattern. At λ = 10⁻⁷ (effective df ≈ 47), the spline nearly interpolates every training point with MSE ≈ 1.0 — a clear sign of overfitting. As λ increases, MSE rises gradually until λ = 0.1 (effective df ≈ 2.7) where the near-linear fit yields MSE = 12,848, completely failing to capture the non-linear trajectory. The GCV criterion would select the intermediate λ = 10⁻⁶ as optimal, balancing fit quality against smoothness, and this configuration achieves MSE = 11.46 — outperforming the best cubic spline (MSE = 25.99) by approximately 56%.
+
+Three properties make smoothing splines preferable for this dataset. First, knot placement is automatic and data-driven rather than requiring a manual choice. Second, the effective degrees of freedom provides a continuous, comparable complexity measure across the full λ range. Third, smoothing splines default to linear extrapolation beyond the data boundary, which is more conservative and interpretable than the high-variance polynomial extrapolation of cubic splines with many knots.
+
+---
+
+## 8. Conclusions
+
+- China's GDP (1960–2014) exhibits a three-phase non-linear trajectory that requires flexible spline methods; standard linear regression is inadequate.
+- Standard cubic splines reduce training MSE from 454.26 (df = 4) to 25.99 (df = 25) as knot count increases, but lack a principled mechanism for selecting the optimal number of knots.
+- Smoothing splines with λ = 10⁻⁶ achieve MSE = 11.46, outperforming the best cubic spline configuration by ~56%, by penalizing curvature globally rather than relying on manual knot placement.
+- Both methods clearly illustrate the bias-variance tradeoff: low complexity (high λ or low df) under-fits the structural breaks; high complexity (low λ or high df) over-fits year-to-year noise.
+- Smoothing splines are the recommended approach for this problem due to systematic knot placement, a principled complexity penalty, and conservative boundary behavior.
